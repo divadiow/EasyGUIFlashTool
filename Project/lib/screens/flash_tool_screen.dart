@@ -14,6 +14,7 @@ import '../flasher/bk7231_flasher.dart';
 import '../flasher/bl602_flasher.dart';
 import '../flasher/esp32_flasher.dart';
 import '../flasher/wm_flasher.dart';
+import '../flasher/rtl87x0c_flasher.dart';
 import '../flasher/base_flasher.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import '../services/file_opener.dart';
@@ -772,6 +773,7 @@ class _FlashToolScreenState extends State<FlashToolScreen> {
         bkType == BKType.esp32s3 ||
         bkType == BKType.esp32c3;
     final bool isWM = bkType == BKType.w800 || bkType == BKType.w600;
+    final bool isRTL87X0C = bkType == BKType.rtl87x0c;
 
     if (isESP) {
       _currentFlasher = ESPFlasher(
@@ -787,6 +789,12 @@ class _FlashToolScreenState extends State<FlashToolScreen> {
       );
     } else if (isWM) {
       _currentFlasher = WMFlasher(
+        transport: provider.transport,
+        chipType: bkType,
+        baudrate: provider.baudRate,
+      );
+    } else if (isRTL87X0C) {
+      _currentFlasher = RTL87X0CFlasher(
         transport: provider.transport,
         chipType: bkType,
         baudrate: provider.baudRate,

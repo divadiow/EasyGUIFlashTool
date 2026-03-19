@@ -12,6 +12,7 @@ import '../flasher/base_flasher.dart';
 import '../flasher/bk7231_flasher.dart';
 import '../flasher/bl602_flasher.dart';
 import '../flasher/esp32_flasher.dart';
+import '../flasher/rtl87x0c_flasher.dart';
 import '../models/chip_platform.dart';
 import '../models/log_level.dart';
 import '../serial/serial_io_mobile.dart' as io;
@@ -225,10 +226,17 @@ class CommandLineRunner {
         chipType == BKType.bl702 ||
         chipType == BKType.bl616;
     final bool isESP = chipType == BKType.esp32;
+    final bool isRTL87X0C = chipType == BKType.rtl87x0c;
 
     final BaseFlasher flasher;
     if (isESP) {
       flasher = ESPFlasher(
+        transport: transport,
+        chipType: chipType,
+        baudrate: baud,
+      );
+    } else if (isRTL87X0C) {
+      flasher = RTL87X0CFlasher(
         transport: transport,
         chipType: chipType,
         baudrate: baud,
