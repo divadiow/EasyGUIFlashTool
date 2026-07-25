@@ -4,27 +4,32 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/services.dart' show rootBundle;
 
-import '../serial/serial_transport.dart';
 import 'base_flasher.dart';
 import 'xmodem.dart';
 
 class RTL87X0CFlasher extends BaseFlasher {
-  static const int flashMmapBase = 0x98000000;
-  static const int readUnitSize = 0x1000;
   static const int verifyWindowSize = 256 * 1024;
-  static const int readChunkRetryLimit = 3;
-  static const int readWindowRetryLimit = 3;
   static const int writeWindowRetryLimit = 3;
   static const int hashRetryLimit = 3;
   static const int commandRetryLimit = 3;
   static const int fallbackBaudRate = 115200;
+  static const int readStubAddress = 0x10035000;
+  static const int readStubParametersAddress = 0x10038000;
+  static const List<String> _usedCommands = <String>[
+    'ping', 'disc', 'ucfg', 'DW', 'DB', 'EW',
+    'EB', 'WDTRST', 'hashq', 'fwd', 'fwdram',
+  ];
 
   int? _flashMode;
   bool _flashConfigured = false;
   int? _flashHashOffset;
   bool _isInFallbackMode = false;
   int _flashSizeMB = 2;
+  int _currentBaud = fallbackBaudRate;
+  int? _funcPtr;
+  String _funcName = '';
 
   final List<int> _rxBuffer = [];
   StreamSubscription<Uint8List>? _rxSub;
@@ -32,11 +37,12 @@ class RTL87X0CFlasher extends BaseFlasher {
 
   RTL87X0CFlasher({
     required super.transport,
-    super.chipType = BKType.detect, // Will be overridden if specified
-    super.baudrate = 1500000,       // Default Ameba default
+    super.chipType = BKType.detect,
+    super.baudrate = 1500000,
   }) {
-    // Override chipType if default since we need uniquely identify RTLZ2
-    chipType = BKType.invalid; // Will patch this in base_flasher.dart
+    if (chipType == BKType.detect) {
+      chipType = BKType.rtl87x0c;
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -167,6 +173,9 @@ class RTL87X0CFlasher extends BaseFlasher {
     _flashConfigured = false;
     _flashHashOffset = null;
     _isInFallbackMode = false;
+    _currentBaud = fallbackBaudRate;
+    _funcPtr = null;
+    _funcName = '';
     await transport.disconnect();
   }
 
@@ -204,10 +213,10 @@ class RTL87X0CFlasher extends BaseFlasher {
     int offset = 0;
     final deadline = DateTime.now().add(Duration(milliseconds: timeoutMs));
     while (offset < count && !isCancelled && DateTime.now().isBefore(deadline)) {
-      if (_rxBuffer.length > offset) {
-        int toCopy = min(count - offset, _rxBuffer.length - offset);
+      if (_rxBuffer.isNotEmpty) {
+        int toCopy = min(count - offset, _rxBuffer.length);
         for(int i = 0; i < toCopy; i++) {
-          buf[offset + i] = _rxBuffer[offset + i];
+          buf[offset + i] = _rxBuffer.removeAt(0);
         }
         offset += toCopy;
       }
@@ -215,7 +224,6 @@ class RTL87X0CFlasher extends BaseFlasher {
       await Future.delayed(const Duration(milliseconds: 2));
     }
     if (isCancelled || offset < count) return null;
-    _rxBuffer.removeRange(0, count);
     return buf;
   }
 
@@ -258,8 +266,8 @@ class RTL87X0CFlasher extends BaseFlasher {
     // Wait slightly to let any dangling OS buffer bytes arrive before flushing
     await Future.delayed(const Duration(milliseconds: 15));
     _flush();
-    List<int> bytes = utf8.encode('$cmd\n');
-    transport.write(Uint8List.fromList(bytes));
+    final bytes = utf8.encode('$cmd\n');
+    await transport.write(Uint8List.fromList(bytes));
     if (_isInFallbackMode) {
       await _readExactly(bytes.length + 1, timeoutMs: 100);
     }
@@ -305,13 +313,13 @@ class RTL87X0CFlasher extends BaseFlasher {
       } catch (e) { last = e is Exception ? e : Exception(e.toString()); }
       
       if (attempt < attempts) {
-        addWarningLine('$label retrying attempt ${attempt + 1}/$attempts: ${last}');
+        addWarningLine('$label retrying attempt ${attempt + 1}/$attempts: $last');
         _flush();
         try { await _link(); } catch(_) {}
         await Future.delayed(const Duration(milliseconds: 50));
       }
     }
-    if (last != null) addErrorLine('$label failed after $attempts attempts: ${last}');
+    if (last != null) addErrorLine('$label failed after $attempts attempts: $last');
     return null;
   }
 
@@ -369,6 +377,7 @@ class RTL87X0CFlasher extends BaseFlasher {
 
   Future<bool> _tryChangeBaudOnce(int fromBaud, int toBaud, int txIdleMs, int oldReadMs, int newReadMs) async {
     await transport.setBaudRate(fromBaud);
+    _currentBaud = fromBaud;
     _flush();
     if (!await _link()) return false;
     await _wdtDisableRaw();
@@ -376,6 +385,7 @@ class RTL87X0CFlasher extends BaseFlasher {
     await _waitForTxIdle(txIdleMs);
     var oldSide = await _readWithTimeout(oldReadMs);
     await transport.setBaudRate(toBaud);
+    _currentBaud = toBaud;
     await Future.delayed(const Duration(milliseconds: 20));
     var newSide = await _readWithTimeout(newReadMs);
     if (oldSide.contains('OK') || newSide.contains('OK')) {
@@ -388,17 +398,19 @@ class RTL87X0CFlasher extends BaseFlasher {
       return true;
     }
     await transport.setBaudRate(fromBaud);
+    _currentBaud = fromBaud;
     _flush();
     return false;
   }
 
   Future<bool> _changeBaud(int baud) async {
-    if (baud == 115200) {
+    if (baud == _currentBaud) {
       return await _link();
     }
     addLogLine('Setting baud rate to $baud');
-    if (await _tryChangeBaudOnce(115200, baud, 150, 40, 250)) return true;
-    if (await _tryChangeBaudOnce(115200, baud, 300, 75, 450)) return true;
+    final originalBaud = _currentBaud;
+    if (await _tryChangeBaudOnce(originalBaud, baud, 150, 40, 250)) return true;
+    if (await _tryChangeBaudOnce(originalBaud, baud, 300, 75, 450)) return true;
     addErrorLine('Baud change failed');
     return false;
   }
@@ -407,7 +419,7 @@ class RTL87X0CFlasher extends BaseFlasher {
     int bytesRead = 0;
     int expectedBytes = count * 4;
     await _command('DW ${start.toRadixString(16).toUpperCase()} $count');
-    int timeoutMs = max(1500, count * 118000 ~/ baudrate + 500);
+    int timeoutMs = max(1500, count * 118000 ~/ _currentBaud + 500);
     final deadline = DateTime.now().add(Duration(milliseconds: timeoutMs));
     
     while (bytesRead < expectedBytes && DateTime.now().isBefore(deadline) && !isCancelled) {
@@ -433,17 +445,46 @@ class RTL87X0CFlasher extends BaseFlasher {
     return bytesRead == expectedBytes && words.length == count;
   }
 
-  Future<Uint8List?> _dumpFlashWords(int start, int byteCount) async {
-    int wordCount = byteCount ~/ 4;
-    List<int> words = [];
-    if (!await _dumpWords(start, wordCount, words)) return null;
-    
-    var bytes = Uint8List(wordCount * 4);
-    var byteData = ByteData.view(bytes.buffer);
-    for (int i = 0; i < wordCount; i++) {
-      byteData.setUint32(i * 4, words[i], Endian.little);
+  Future<Uint8List?> _dumpBytes(int start, int count) async {
+    final data = <int>[];
+    await _command('DB ${start.toRadixString(16).toUpperCase()} $count');
+    final timeoutMs = max(1500, count * 37000 ~/ _currentBaud + 500);
+    final deadline = DateTime.now().add(Duration(milliseconds: timeoutMs));
+
+    while (data.length < count &&
+        DateTime.now().isBefore(deadline) &&
+        !isCancelled) {
+      try {
+        final line = await _readLine(200);
+        final parts = line.split(' ').where((x) => x.isNotEmpty).toList();
+        if (parts.isEmpty || parts[0] == '[Addr]' || parts[0] == '\r') {
+          continue;
+        }
+
+        final address = int.tryParse(
+            parts[0].replaceAll(':', '').replaceAll('\r', ''),
+            radix: 16);
+        if (address == null) continue;
+        if (address != start + data.length) {
+          throw Exception('Unexpected byte dump address');
+        }
+        if (parts.length < 17) {
+          throw Exception('Incomplete byte dump line');
+        }
+
+        for (int i = 1; i < 17 && data.length < count; i++) {
+          final value = int.tryParse(parts[i].trim(), radix: 16);
+          if (value == null) {
+            throw Exception('Invalid byte dump data');
+          }
+          data.add(value);
+        }
+      } on TimeoutException {
+        continue;
+      }
     }
-    return bytes;
+
+    return data.length == count ? Uint8List.fromList(data) : null;
   }
 
   Future<int> _registerRead(int addr) async {
@@ -465,10 +506,32 @@ class RTL87X0CFlasher extends BaseFlasher {
   }
 
   Future<bool> _memoryBoot(int addr) async {
-    addLogLine('Memory boot 0x${addr.toRadixString(16)}');
-    // For simplicity, implement dummy since we just skip unused logic if we don't have FuncPtr parsing
-    // But let's implement the basic one if needed
-    return true; // Wait, actually fallback memory boot is complex. We will implement minimal version.
+    addr |= 1;
+    if (_funcPtr == null) {
+      final commands = await _registerRead(0x1002F054);
+      for (int entry = commands; entry < commands + 8 * 12; entry += 12) {
+        final namePtr = await _registerRead(entry);
+        if (namePtr == 0) break;
+        final nameBytes = await _dumpBytes(namePtr, 16);
+        if (nameBytes == null) continue;
+        final nul = nameBytes.indexOf(0);
+        final name = ascii.decode(
+            nameBytes.sublist(0, nul < 0 ? nameBytes.length : nul),
+            allowInvalid: true);
+        if (name.isEmpty || _usedCommands.contains(name)) continue;
+        _funcPtr = entry + 4;
+        _funcName = name;
+        break;
+      }
+    }
+    if (_funcPtr == null) {
+      throw Exception('Memory boot function was not found');
+    }
+    await _registerWrite(_funcPtr!, addr);
+    addLogLine(
+        "Jump to 0x${_funcPtr!.toRadixString(16).toUpperCase()} using '$_funcName'");
+    await _command(_funcName);
+    return true;
   }
 
   Future<Uint8List?> _flashReadHashCore(int offset, int length) async {
@@ -505,11 +568,28 @@ class RTL87X0CFlasher extends BaseFlasher {
   }
 
   Future<bool> _verifyFlashWindow(Uint8List expected, int offset) async {
-    var expectedHash = sha256.convert(expected).bytes;
-    var actualHash = await _flashReadHash(offset, expected.length);
+    final expectedDigest = sha256.convert(expected);
+    final expectedHash = expectedDigest.bytes;
+    final actualHash = await _flashReadHash(offset, expected.length);
     if (actualHash == null) return false;
     for (int i = 0; i < 32; i++) {
-      if (expectedHash[i] != actualHash[i]) return false;
+      if (expectedHash[i] != actualHash[i]) {
+        final actualDigest = actualHash
+            .map((value) => value.toRadixString(16).padLeft(2, '0'))
+            .join();
+        addWarningLine(
+            'Verify hash mismatch: expected $expectedDigest, got $actualDigest');
+        addWarningLine('Falling back to byte-exact stub readback...');
+        final readback = await _readFlashWithStub(offset, expected.length);
+        if (readback == null || readback.length != expected.length) {
+          return false;
+        }
+        for (int j = 0; j < expected.length; j++) {
+          if (readback[j] != expected[j]) return false;
+        }
+        addLogLine('Stub readback matched despite the stale device hash.');
+        return true;
+      }
     }
     return true;
   }
@@ -546,6 +626,15 @@ class RTL87X0CFlasher extends BaseFlasher {
     int res = await xm.send(data);
     if (res != data.length) return false;
     
+    await Future.delayed(const Duration(milliseconds: 50));
+    return await _link();
+  }
+
+  Future<bool> _ramTransmit(Uint8List data, int offset) async {
+    await _command('fwdram ${offset.toRadixString(16)}');
+    final sender = XmodemSender(transport);
+    final sent = await sender.send(data);
+    if (sent != data.length) return false;
     await Future.delayed(const Duration(milliseconds: 50));
     return await _link();
   }
@@ -616,6 +705,7 @@ class RTL87X0CFlasher extends BaseFlasher {
     addLog('Port ready!\n');
     try {
       await transport.setBaudRate(115200);
+      _currentBaud = fallbackBaudRate;
       await Future.delayed(const Duration(milliseconds: 50));
     } catch (_) {} // ignore unsupported ops
     if (!await _link()) {
@@ -634,111 +724,71 @@ class RTL87X0CFlasher extends BaseFlasher {
     await _command('EW 0x40020008 0');
     await Future.delayed(const Duration(milliseconds: 10));
     _flush();
-    // Use dummy size as 2MB if we can't parse it easily
-    _flashSizeMB = 2; 
-  }
-
-  Future<Uint8List?> _readVerifiedWindow(int startAddr, int windowLength, int progressBase, int progressTotal) async {
-    for (int attempt = 1; attempt <= readWindowRetryLimit; attempt++) {
-      if (isCancelled) return null;
-      var window = Uint8List(windowLength);
-      int copied = 0;
-      bool failed = false;
-
-      for (int chunkOffset = 0; chunkOffset < windowLength; chunkOffset += readUnitSize) {
-        if (isCancelled) return null;
-        int chunkLength = min(readUnitSize, windowLength - chunkOffset);
-        int chunkAddr = startAddr + chunkOffset;
-        Uint8List? chunk;
-        
-        for (int chunkAttempt = 1; chunkAttempt <= readChunkRetryLimit; chunkAttempt++) {
-          bool success = await _runWithRecovery('Read ${formatHex(chunkAddr)}', commandRetryLimit, () async {
-            chunk = await _dumpFlashWords(chunkAddr | flashMmapBase, chunkLength);
-            return chunk != null;
-          });
-          if (success) {
-            if (chunkAttempt > 1) addLogLine('Read retry succeeded at ${formatHex(chunkAddr)}');
-            break;
-          }
-          if (chunkAttempt < readChunkRetryLimit) {
-            addWarningLine('Read retry at ${formatHex(chunkAddr)} (${chunkAttempt + 1}/$readChunkRetryLimit)');
-            await Future.delayed(const Duration(milliseconds: 75));
-          }
-        }
-        
-        if (chunk == null || chunk!.length != chunkLength) {
-          addWarningLine('Read failed at ${formatHex(chunkAddr)}');
-          failed = true;
-          break;
-        }
-        window.setRange(copied, copied + chunkLength, chunk!);
-        copied += chunkLength;
-        setProgress(progressBase + copied, progressTotal);
-      }
-      
-      if (failed) {
-        if (attempt == 2 && baudrate > fallbackBaudRate) await _changeBaud(fallbackBaudRate);
-        continue;
-      }
-      
-      addLogLine('Verifying read window ${formatHex(startAddr)} len ${formatHex(windowLength)}');
-      if (await _verifyFlashWindow(window, startAddr)) {
-        return window;
-      }
-      
-      addWarningLine('Read verify failed at ${formatHex(startAddr)}');
-      _flush();
-      try { await _link(); } catch (_) {}
-      if (attempt == 2 && baudrate > fallbackBaudRate) await _changeBaud(fallbackBaudRate);
+    final bytes = await _dumpBytes(0x40020060, 16);
+    if (bytes == null || bytes.length < 5) {
+      throw Exception('Failed to read flash ID from register dump');
     }
-    return null;
+    _flashSizeMB = (1 << (bytes[1] - 0x11)) ~/ 8;
+    addLogLine(
+        'Flash ID: 0x${bytes[0].toRadixString(16).padLeft(2, '0')}'
+        '${bytes[4].toRadixString(16).padLeft(2, '0')}'
+        '${bytes[1].toRadixString(16).padLeft(2, '0')}');
+    addLogLine('${_flashSizeMB}MB flash size detected');
   }
 
   Future<Uint8List?> _readFlash(int addr, int amount) async {
-    var ret = Uint8List(amount);
     await _flashInit();
     if (!await _changeBaud(baudrate)) {
       await closePort();
       return null;
     }
 
-    // Hashing will be performed on the entire `ret` buffer at the end.
+    final result = await _readFlashWithStub(addr, amount);
+    if (result == null || result.length != amount) {
+      throw Exception('Z2 XMODEM read failed');
+    }
 
-    int currentAddr = addr;
-    int remaining = amount;
-    int copied = 0;
+    addLogLine('Getting full hash...');
+    final readHash = sha256.convert(result).bytes;
+    final expectedHash = await _flashReadHash(addr, amount);
+    bool hashesMatch = expectedHash != null && expectedHash.length == readHash.length;
+    for (int i = 0; hashesMatch && i < readHash.length; i++) {
+      hashesMatch = readHash[i] == expectedHash![i];
+    }
+    if (!hashesMatch) {
+      throw Exception('Flash read SHA-256 mismatch');
+    }
 
-    while (remaining > 0) {
-      if (isCancelled) return null;
-      int windowLength = min(verifyWindowSize, remaining);
-      var window = await _readVerifiedWindow(currentAddr, windowLength, copied, amount);
-      if (window == null) throw Exception('Verified read failed at ${formatHex(currentAddr)}');
-      
-      ret.setRange(copied, copied + windowLength, window);
-      copied += windowLength;
-      currentAddr += windowLength;
-      remaining -= windowLength;
-      setProgress(copied, amount);
+    addSuccess('Hash matches ${sha256.convert(result)}!');
+    return result;
+  }
+
+  Future<Uint8List?> _readFlashWithStub(int addr, int amount) async {
+    addLogLine('Uploading Z2 XMODEM read stub...');
+    await _registerWrite(readStubParametersAddress, addr);
+    await _registerWrite(readStubParametersAddress + 4, amount);
+    await _registerWrite(readStubParametersAddress + 8, 0);
+
+    final asset = await rootBundle.load(
+        'assets/floaders/Z2_XModem_Stub.bin');
+    final stub = asset.buffer.asUint8List(
+        asset.offsetInBytes, asset.lengthInBytes);
+    if (!await _ramTransmit(stub, readStubAddress)) {
+      throw Exception('Z2 read stub upload failed');
     }
-    
-    addLogLine('\nGetting full hash...');
-    var readHashBytes = sha256.convert(ret).bytes;
-    var expectedHashBytes = await _flashReadHash(addr, amount);
-    if (expectedHashBytes == null) throw Exception('Final hash read failed');
-    
-    bool match = true;
-    for (int i = 0; i < 32; i++) {
-        if (readHashBytes[i] != expectedHashBytes[i]) match = false;
+    if (!await _memoryBoot(readStubAddress)) {
+      throw Exception('Z2 read stub did not start');
     }
-    if (!match) {
-        addErrorLine('Hash mismatch!');
-        await _changeBaud(fallbackBaudRate);
-        await closePort();
-        return null;
-    }
-    
-    addSuccess('Hash matches!');
-    return ret;
+    await Future.delayed(const Duration(milliseconds: 5));
+
+    final receiver = XmodemReceiver(transport);
+    receiver.isCancelled = () => isCancelled;
+    receiver.onPacketReceived = (received, total, block) {
+      setProgress(received, total);
+    };
+    final result = await receiver.receive(amount);
+    _flush();
+    return result;
   }
 
   Future<bool> _sendEraseCommand(String cmd) async {

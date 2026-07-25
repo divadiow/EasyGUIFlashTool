@@ -1,6 +1,5 @@
-/// Minimal async XMODEM-1K sender, ported from C# `Xmodem.cs`.
+/// Minimal async XMODEM implementation, ported from C# `Xmodem.cs`.
 ///
-/// Only the **sender** side is implemented — this is all WMFlasher needs.
 /// Uses [SerialTransport] for cross-platform serial I/O.
 library;
 
@@ -13,6 +12,7 @@ import 'crc.dart';
 // ─── XMODEM protocol bytes ─────────────────────────────────────────────────
 
 const int _stx = 0x02; // 1024-byte packet header
+const int _soh = 0x01; // 128-byte packet header
 const int _ack = 0x06;
 const int _nak = 0x15;
 const int _can = 0x18;
@@ -22,6 +22,8 @@ const int _charC = 0x43; // 'C' — CRC-mode initiation
 /// Progress callback: (bytesSent, totalBytes, blockNum, fileOffset).
 typedef XmodemProgressCallback = void Function(
     int bytesSent, int totalBytes, int blockNum, int offset);
+typedef XmodemReceiveProgressCallback = void Function(
+    int bytesReceived, int totalBytes, int blockNum);
 
 // ─── XmodemSender ──────────────────────────────────────────────────────────
 
@@ -195,5 +197,156 @@ class XmodemSender {
     }
 
     return totalSent; // EOT not ACKed but data was sent
+  }
+}
+
+// ─── XmodemReceiver ────────────────────────────────────────────────────────
+
+/// Async XMODEM-CRC receiver accepting both 128-byte and 1K packets.
+class XmodemReceiver {
+  final SerialTransport _transport;
+  final List<int> _rxBuf = [];
+  StreamSubscription<Uint8List>? _rxSub;
+
+  int maxRetries = 10;
+  int initiationTimeoutMs = 10000;
+  int packetTimeoutMs = 5000;
+  XmodemReceiveProgressCallback? onPacketReceived;
+  bool Function()? isCancelled;
+
+  XmodemReceiver(this._transport);
+
+  void _startListening() {
+    _rxBuf.clear();
+    _rxSub?.cancel();
+    _rxSub = _transport.stream.listen((data) {
+      _rxBuf.addAll(data);
+    });
+  }
+
+  Future<void> _stopListening() async {
+    await _rxSub?.cancel();
+    _rxSub = null;
+  }
+
+  Future<int> _readByte(int timeoutMs) async {
+    final deadline = DateTime.now().add(Duration(milliseconds: timeoutMs));
+    while (DateTime.now().isBefore(deadline)) {
+      if (isCancelled?.call() ?? false) return _can;
+      if (_rxBuf.isNotEmpty) return _rxBuf.removeAt(0);
+      await Future.delayed(const Duration(milliseconds: 1));
+    }
+    return -1;
+  }
+
+  Future<Uint8List?> _readBytes(int count, int timeoutMs) async {
+    final result = Uint8List(count);
+    final deadline = DateTime.now().add(Duration(milliseconds: timeoutMs));
+    int offset = 0;
+    while (offset < count && DateTime.now().isBefore(deadline)) {
+      if (isCancelled?.call() ?? false) return null;
+      while (_rxBuf.isNotEmpty && offset < count) {
+        result[offset++] = _rxBuf.removeAt(0);
+      }
+      if (offset < count) {
+        await Future.delayed(const Duration(milliseconds: 1));
+      }
+    }
+    return offset == count ? result : null;
+  }
+
+  Future<void> _writeByte(int value) async {
+    await _transport.write(Uint8List.fromList([value]));
+  }
+
+  /// Receives exactly [expectedLength] bytes and discards final packet padding.
+  ///
+  /// Returns `null` on cancellation, timeout, or repeated invalid packets.
+  Future<Uint8List?> receive(int expectedLength) async {
+    if (expectedLength < 0) {
+      throw ArgumentError.value(expectedLength, 'expectedLength');
+    }
+
+    _startListening();
+    try {
+      final output = BytesBuilder(copy: false);
+      int expectedBlock = 1;
+      int failures = 0;
+      int header = -1;
+      final initiationDeadline =
+          DateTime.now().add(Duration(milliseconds: initiationTimeoutMs));
+
+      while (header < 0 && DateTime.now().isBefore(initiationDeadline)) {
+        await _writeByte(_charC);
+        header = await _readByte(1000);
+        if (header != _soh && header != _stx && header != _eot) {
+          header = -1;
+        }
+      }
+      if (header < 0) return null;
+
+      while (true) {
+        if (isCancelled?.call() ?? false) {
+          await _writeByte(_can);
+          await _writeByte(_can);
+          return null;
+        }
+
+        if (header == _eot) {
+          await _writeByte(_ack);
+          final bytes = output.takeBytes();
+          if (bytes.length < expectedLength) return null;
+          return Uint8List.sublistView(bytes, 0, expectedLength);
+        }
+
+        if (header != _soh && header != _stx) {
+          header = await _readByte(packetTimeoutMs);
+          if (header < 0 && ++failures >= maxRetries) return null;
+          continue;
+        }
+
+        final packetSize = header == _stx ? 1024 : 128;
+        final packet = await _readBytes(2 + packetSize + 2, packetTimeoutMs);
+        if (packet == null) {
+          if (++failures >= maxRetries) return null;
+          await _writeByte(_nak);
+          header = await _readByte(packetTimeoutMs);
+          continue;
+        }
+
+        final block = packet[0];
+        final complement = packet[1];
+        final data = Uint8List.sublistView(packet, 2, 2 + packetSize);
+        final receivedCrc =
+            (packet[2 + packetSize] << 8) | packet[3 + packetSize];
+        final calculatedCrc =
+            CRC16.compute(CRC16Type.xmodem, data, 0, data.length);
+
+        if (complement != (255 - block) || receivedCrc != calculatedCrc) {
+          if (++failures >= maxRetries) return null;
+          await _writeByte(_nak);
+        } else if (block == expectedBlock) {
+          output.add(data);
+          expectedBlock = (expectedBlock + 1) & 0xFF;
+          failures = 0;
+          await _writeByte(_ack);
+          onPacketReceived?.call(
+              output.length.clamp(0, expectedLength),
+              expectedLength,
+              block);
+        } else if (block == ((expectedBlock - 1) & 0xFF)) {
+          // The sender did not see our ACK and repeated the previous packet.
+          await _writeByte(_ack);
+        } else {
+          if (++failures >= maxRetries) return null;
+          await _writeByte(_nak);
+        }
+
+        header = await _readByte(packetTimeoutMs);
+        if (header < 0 && ++failures >= maxRetries) return null;
+      }
+    } finally {
+      await _stopListening();
+    }
   }
 }
